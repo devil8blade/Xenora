@@ -30,6 +30,20 @@ pub struct CompiledShader {
     pub msl: String,
 }
 
+/// Optional translation passes applied after verification.
+///
+/// Default options preserve the historical IR shape: constants from scalar
+/// evaluation and immediates remain, but pure vector expressions between
+/// constants are not rewritten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompileOptions {
+    /// Replace pure vector unary/binary ops whose operands are already
+    /// `const.u32` with a single constant. Floating-point ops fold only when
+    /// the existing exact positive-normal rules accept the result. Loads,
+    /// stores, lane masks, merges and branches are never folded.
+    pub fold_constants: bool,
+}
+
 #[derive(Debug)]
 pub enum CompileError {
     InvalidLength {
@@ -431,10 +445,23 @@ fn exact_float_result(operator: Binary, left: KnownBits, right: KnownBits) -> Op
 /// Compiles explicitly tagged raw machine code to a synthetic Metal compute kernel.
 ///
 /// Bind equal-length disjoint input and output word buffers and dispatch one
-/// invocation per word in a one-dimensional grid.
+/// invocation per word in a one-dimensional grid. Equivalent to
+/// [`compile_with`] using [`CompileOptions::default`].
 pub fn compile(architecture: Architecture, bytes: &[u8]) -> Result<CompiledShader, CompileError> {
+    compile_with(architecture, bytes, CompileOptions::default())
+}
+
+/// Compiles like [`compile`], with optional IR passes selected by `options`.
+pub fn compile_with(
+    architecture: Architecture,
+    bytes: &[u8],
+    options: CompileOptions,
+) -> Result<CompiledShader, CompileError> {
     let decoded = decode_fixture(architecture, bytes)?;
-    let operations = lift(&decoded, bytes.len())?;
+    let mut operations = lift(&decoded, bytes.len())?;
+    if options.fold_constants {
+        fold_constant_ops(&mut operations);
+    }
 
     let disassembly = decoded.iter().map(|line| format!("{line}\n")).collect();
     let mut ir = String::new();
@@ -1257,6 +1284,118 @@ fn lift(decoded: &[DecodedInstruction], code_len: usize) -> Result<Vec<(usize, O
         offset: code_len,
         reason: "missing program termination",
     })
+}
+
+/// Replace pure constant expressions with `Op::Constant` in place.
+///
+/// Operands stay addressable by their original `Value` indices so later uses
+/// need no rewrite. Side-effecting and mask-dependent ops are left unchanged.
+fn fold_constant_ops(operations: &mut [(usize, Op)]) {
+    for index in 0..operations.len() {
+        let folded = match operations[index].1 {
+            Op::Unary(operator, source) => {
+                const_value(operations, source).and_then(|bits| eval_unary(operator, bits))
+            }
+            Op::Binary(operator, left, right) => {
+                match (
+                    const_value(operations, left),
+                    const_value(operations, right),
+                ) {
+                    (Some(left), Some(right)) => eval_binary(operator, left, right),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(bits) = folded {
+            operations[index].1 = Op::Constant(bits);
+        }
+    }
+}
+
+fn const_value(operations: &[(usize, Op)], value: Value) -> Option<u32> {
+    match operations.get(value.0).map(|(_, operation)| *operation)? {
+        Op::Constant(bits) => Some(bits),
+        _ => None,
+    }
+}
+
+fn concrete_bits(facts: KnownBits) -> Option<u32> {
+    if let Some([first, second]) = facts.values {
+        return (first == second).then_some(first);
+    }
+    if facts.zero | facts.one == u32::MAX {
+        Some(facts.one)
+    } else {
+        None
+    }
+}
+
+fn eval_unary(operator: VectorUnary, source: u32) -> Option<u32> {
+    Some(match operator {
+        VectorUnary::Not => !source,
+        VectorUnary::ReverseBits => source.reverse_bits(),
+        VectorUnary::FindHighUnsigned => {
+            if source == 0 {
+                0xffff_ffff
+            } else {
+                source.leading_zeros()
+            }
+        }
+        VectorUnary::FindLow => {
+            if source == 0 {
+                0xffff_ffff
+            } else {
+                source.trailing_zeros()
+            }
+        }
+        VectorUnary::FindHighSigned => {
+            if source == 0 || source == 0xffff_ffff {
+                0xffff_ffff
+            } else {
+                (source ^ (0u32.wrapping_sub(source >> 31))).leading_zeros()
+            }
+        }
+    })
+}
+
+fn eval_binary(operator: Binary, left: u32, right: u32) -> Option<u32> {
+    match operator {
+        Binary::FloatAdd | Binary::FloatMul => concrete_bits(exact_float_result(
+            operator,
+            KnownBits::constant(left),
+            KnownBits::constant(right),
+        )?),
+        Binary::Vector(operation) => Some(eval_vector_binary(operation, left, right)),
+    }
+}
+
+fn eval_vector_binary(operation: VectorBinary, left: u32, right: u32) -> u32 {
+    let i24 = |value: u32| ((value as i32) << 8) >> 8;
+    let u24 = |value: u32| value & 0x00ff_ffff;
+    match operation {
+        VectorBinary::Add => left.wrapping_add(right),
+        VectorBinary::Sub => left.wrapping_sub(right),
+        VectorBinary::Xnor => !(left ^ right),
+        VectorBinary::MinSigned => (left as i32).min(right as i32) as u32,
+        VectorBinary::MinUnsigned => left.min(right),
+        VectorBinary::MaxSigned => (left as i32).max(right as i32) as u32,
+        VectorBinary::MaxUnsigned => left.max(right),
+        VectorBinary::Mul24Signed => (i24(left) as u32).wrapping_mul(i24(right) as u32),
+        VectorBinary::Mul24Unsigned => u24(left).wrapping_mul(u24(right)),
+        VectorBinary::MulHi24Signed => {
+            ((i64::from(i24(left)) * i64::from(i24(right))) >> 32) as u32
+        }
+        VectorBinary::MulHi24Unsigned => {
+            ((u64::from(u24(left)) * u64::from(u24(right))) >> 32) as u32
+        }
+        VectorBinary::And => left & right,
+        VectorBinary::Or => left | right,
+        VectorBinary::Xor => left ^ right,
+        VectorBinary::ShiftLeft => left << (right & 31),
+        VectorBinary::ShiftRight => left >> (right & 31),
+        VectorBinary::ArithmeticShiftRight => ((left as i32) >> (right & 31)) as u32,
+    }
 }
 
 /// A wave-uniform constant operand at `offset`.

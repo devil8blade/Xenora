@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use xenora_shader::{Architecture, CompileError, compile};
+use xenora_shader::{Architecture, CompileError, CompileOptions, compile, compile_with};
 
 const FIXTURE: &[u8] = include_bytes!("../../../fixtures/rdna2/add.bin");
 
@@ -404,4 +404,106 @@ fn vop1_integer_fixture_lowers_unary_and_masked_swap() {
         compiled.msl,
         include_str!("../../../fixtures/golden/vector-unary.metal")
     );
+}
+
+/// load; mov v2,immA; mov v3,immB; and v2,v2,v3; xor v1,v1,v2; store.
+/// Independently: A & B = 0x12005600.
+fn constant_and_fixture() -> Vec<u8> {
+    const A: u32 = 0x1234_5678;
+    const B: u32 = 0xff00_ff00;
+    [
+        0xe030_2000,
+        0x8000_0100, // buffer_load_dword v1
+        0xbf8c_3f70, // s_waitcnt vmcnt(0)
+        0x7e04_02ff,
+        A, // v_mov_b32 v2, A
+        0x7e06_02ff,
+        B,           // v_mov_b32 v3, B
+        0x3604_0702, // v_and_b32 v2, v2, v3
+        0x3a02_0501, // v_xor_b32 v1, v1, v2
+        0xe070_2000,
+        0x8001_0100, // buffer_store_dword v1
+        0xbbfd_0000, // s_waitcnt_vscnt
+        0xbf81_0000, // s_endpgm
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect()
+}
+
+#[test]
+fn default_compile_matches_fold_constants_off() {
+    let code = constant_and_fixture();
+    let baseline = compile(Architecture::Gfx1030, &code).unwrap();
+    let explicit = compile_with(
+        Architecture::Gfx1030,
+        &code,
+        CompileOptions {
+            fold_constants: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(baseline.ir, explicit.ir);
+    assert_eq!(baseline.msl, explicit.msl);
+    assert!(baseline.ir.contains("and.b32"));
+}
+
+#[test]
+fn opt_in_constant_folding_rewrites_pure_vector_and() {
+    let code = constant_and_fixture();
+    let plain = compile_with(
+        Architecture::Gfx1030,
+        &code,
+        CompileOptions {
+            fold_constants: false,
+        },
+    )
+    .unwrap();
+    let folded = compile_with(
+        Architecture::Gfx1030,
+        &code,
+        CompileOptions {
+            fold_constants: true,
+        },
+    )
+    .unwrap();
+
+    // Independent expectation: 0x12345678 & 0xff00ff00 == 0x12005600.
+    assert!(
+        plain.ir.contains("and.b32"),
+        "unoptimized IR should keep the vector and: {}",
+        plain.ir
+    );
+    assert!(
+        !folded.ir.contains("and.b32"),
+        "folded IR should drop the pure and: {}",
+        folded.ir
+    );
+    assert!(
+        folded.ir.contains("const.u32 0x12005600"),
+        "folded IR should materialize the independent constant: {}",
+        folded.ir
+    );
+    assert!(
+        folded.msl.contains("0x12005600u"),
+        "folded MSL should use the independent constant: {}",
+        folded.msl
+    );
+}
+
+#[test]
+fn folding_is_noop_on_add_fixture() {
+    let folded = compile_with(
+        Architecture::Gfx1030,
+        FIXTURE,
+        CompileOptions {
+            fold_constants: true,
+        },
+    )
+    .unwrap();
+    let plain = compile(Architecture::Gfx1030, FIXTURE).unwrap();
+    // add.bin has no pure constant-constant vector op, so folding is a no-op.
+    assert_eq!(folded.ir, plain.ir);
+    assert_eq!(folded.msl, plain.msl);
+    assert_eq!(plain.ir, include_str!("../../../fixtures/golden/add.ir"));
 }
