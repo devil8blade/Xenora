@@ -40,6 +40,7 @@ either path. The [changelog](../CHANGELOG.md) records notable changes.
 ## Testing, validation, and benchmarks
 
 - [Engineering progress](progress.md) — Verification commands, metric definitions, and open release gates.
+- [CPU and loader regression coverage map](testing/cpu-coverage.md) — Declared x86-64 forms, native versus shared-semantic classes, fixture evidence and intentional rejections.
 - [Test inventory comparison](testing/test-inventory.md) — Detect missing or newly ignored Cargo tests across commits.
 - [Persistent resource and translated rendering acceptance](testing/x9-acceptance.md) — Pinned upstream tests, native ARM64 results and unsupported cases.
 - [Baseline acceptance](testing/phase-02-baseline.md), [Phase 01 assurance](testing/phase01-assurance.md), and [independent reviews](testing/review-log.md) — Candidate-specific results and release findings.
